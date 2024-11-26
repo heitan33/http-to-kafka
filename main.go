@@ -13,13 +13,12 @@ import (
 
 type KafkaProducer struct {
     producer *kafka.Producer
-    topic    string
-    messages chan json.RawMessage
+    messages chan kafka.Message
     wg       sync.WaitGroup
     closed   bool
 }
 
-func NewKafkaProducer(brokers string, topic string) (*KafkaProducer, error) {
+func NewKafkaProducer(brokers string) (*KafkaProducer, error) {
     p, err := kafka.NewProducer(&kafka.ConfigMap{
         "bootstrap.servers":         brokers,
         "linger.ms":                 5,
@@ -34,8 +33,7 @@ func NewKafkaProducer(brokers string, topic string) (*KafkaProducer, error) {
 
     kp := &KafkaProducer{
         producer: p,
-        topic:    topic,
-        messages: make(chan json.RawMessage, 100),
+        messages: make(chan kafka.Message, 100),
     }
 
     kp.wg.Add(1)
@@ -46,15 +44,16 @@ func NewKafkaProducer(brokers string, topic string) (*KafkaProducer, error) {
 
 func (kp *KafkaProducer) startProducing() {
     defer kp.wg.Done()
-    for message := range kp.messages {
+    for msg := range kp.messages {
         if kp.closed {
             return
         }
-        log.Printf("Received message to send to Kafka: %s", string(message))
+
+        log.Printf("Sending message to topic %s: %s", *msg.TopicPartition.Topic, string(msg.Value))
 
         const maxRetries = 5
         for i := 0; i < maxRetries; i++ {
-            err := kp.Produce(message)
+            err := kp.producer.Produce(&msg, nil)
             if err != nil {
                 log.Printf("Error producing message to Kafka: %v", err)
                 if i < maxRetries-1 {
@@ -71,32 +70,6 @@ func (kp *KafkaProducer) startProducing() {
     }
 }
 
-func (kp *KafkaProducer) Produce(message json.RawMessage) error {
-    msg := &kafka.Message{
-        TopicPartition: kafka.TopicPartition{Topic: &kp.topic, Partition: kafka.PartitionAny},
-        Value:          message,
-    }
-
-    deliveryChan := make(chan kafka.Event)
-    defer close(deliveryChan)
-
-    err := kp.producer.Produce(msg, deliveryChan)
-    if err != nil {
-        return err
-    }
-
-    e := <-deliveryChan
-    m := e.(*kafka.Message)
-    if m.TopicPartition.Error != nil {
-        log.Printf("Delivery failed: %v\n", m.TopicPartition.Error)
-        return m.TopicPartition.Error
-    } else {
-        log.Printf("Delivered message to %v\n", m.TopicPartition)
-    }
-
-    return nil
-}
-
 func (kp *KafkaProducer) Close() {
     kp.closed = true
     close(kp.messages)
@@ -106,9 +79,10 @@ func (kp *KafkaProducer) Close() {
 
 func main() {
     brokers := os.Getenv("KAFKA_BROKERS")
-    topic := os.Getenv("KAFKA_TOPIC")
+    defaultTopic := os.Getenv("KAFKA_TOPIC")
+    hkTopic := os.Getenv("HK_TOPIC")
 
-    kafkaProducer, err := NewKafkaProducer(brokers, topic)
+    kafkaProducer, err := NewKafkaProducer(brokers)
     if err != nil {
         log.Fatalf("Failed to create Kafka producer: %v", err)
     }
@@ -120,19 +94,43 @@ func main() {
             return
         }
 
-        var jsonData json.RawMessage
+        var jsonData map[string]interface{}
         if err := json.NewDecoder(r.Body).Decode(&jsonData); err != nil {
             http.Error(w, "Invalid JSON", http.StatusBadRequest)
             return
         }
 
-        log.Printf("Received HTTP POST request with data: %s", string(jsonData))
+        log.Printf("Received HTTP POST request with data: %v", jsonData)
 
-        go func(data json.RawMessage) {
+        // Determine which topic to send the message to
+        topic := defaultTopic
+        switch {
+        case jsonData["site"] == "USSL":
+            topic = hkTopic
+        default:
+            log.Println("No matching key found in JSON. Using default topic.")
+            topic = defaultTopic
+        }
+
+        // Serialize the JSON data back to a byte array
+        messageBytes, err := json.Marshal(jsonData)
+        if err != nil {
+            log.Printf("Failed to serialize JSON: %v", err)
+            http.Error(w, "Internal server error", http.StatusInternalServerError)
+            return
+        }
+
+        // Create Kafka message
+        msg := kafka.Message{
+            TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+            Value:          messageBytes,
+        }
+
+        go func(message kafka.Message) {
             if !kafkaProducer.closed {
-                kafkaProducer.messages <- data
+                kafkaProducer.messages <- message
             }
-        }(jsonData)
+        }(msg)
 
         w.WriteHeader(http.StatusOK)
         w.Write([]byte("Data sent to Kafka successfully"))
@@ -143,3 +141,4 @@ func main() {
         log.Fatalf("Failed to start server: %v", err)
     }
 }
+
