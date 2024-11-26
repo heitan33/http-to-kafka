@@ -4,6 +4,7 @@ metadata:
   name: kafka-config
   namespace: public
 data:
+  HK_TOPIC: "four-supply"
   KAFKA_BROKERS: "10.1.21.87:9092,10.1.21.121:9092,10.2.4.20:9092"
   KAFKA_TOPIC: "ingress-nginx-logs"
 ---
@@ -38,6 +39,11 @@ spec:
                 configMapKeyRef:
                   name: kafka-config
                   key: KAFKA_TOPIC
+            - name: HK_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  key: HK_TOPIC
+                  name: kafka-config
       imagePullSecrets:
       - name: aliyun-registry
       dnsPolicy: ClusterFirs
@@ -54,3 +60,4 @@ spec:
       targetPort: 8080
   selector:
     app: kafka-http-server
+
